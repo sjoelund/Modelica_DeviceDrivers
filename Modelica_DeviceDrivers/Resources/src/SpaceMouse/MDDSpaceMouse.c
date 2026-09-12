@@ -333,7 +333,9 @@ DllExport void MDD_spaceMouseGetData(double * pdAxes, int * piButtons) {
  #undef Time */
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <errno.h>
+#include <pthread.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -353,30 +355,45 @@ typedef struct {
     int buttons[MDD_N_BUTTONS];
     int runXEventsProccesing;
     pthread_t thread;
+    /* What the xevent thread failed at, for the Modelica thread to report. */
+    int failed;
+    char error[256];
 } MDDSpaceMouse;
 
-int MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse);
+static void* MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse);
 
-MDD_spaceMouseGetData(double * pdAxes, int * piButtons) {
+/* ModelicaFormatError must not return to its caller, and how a tool arranges
+ * that is up to the tool -- none of it need work from a thread the library
+ * started itself. Record it instead; MDD_spaceMouseGetData reports it. */
+static void* MDD_spaceMouseFail(MDDSpaceMouse* mDDSpaceMouse, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(mDDSpaceMouse->error, sizeof(mDDSpaceMouse->error), format, args);
+    va_end(args);
+    mDDSpaceMouse->failed = 1;
+    return NULL;
+}
+
+void MDD_spaceMouseGetData(double * pdAxes, int * piButtons) {
     static MDDSpaceMouse* mDDSpaceMouse = NULL;
     int i,ret;
 
     if (mDDSpaceMouse == NULL) {
-        mDDSpaceMouse = malloc(sizeof(MDDSpaceMouse));
-
-        for(i=0; i < MDD_N_AXES; i++) {
-            mDDSpaceMouse->axes[i] = 0;
-        }
-        for(i=0; i < MDD_N_BUTTONS; i++) {
-            mDDSpaceMouse->buttons[i] = 0;
+        mDDSpaceMouse = calloc(1, sizeof(MDDSpaceMouse));
+        if (mDDSpaceMouse == NULL) {
+            ModelicaError("MDDSpaceMouse.c: Not enough memory\n");
         }
 
         /* Start dedicated xevent processing thread */
         mDDSpaceMouse->runXEventsProccesing = 1;
-        ret = pthread_create(&mDDSpaceMouse->thread, 0, (void *) MDD_spaceMouseXEventsProcessing, mDDSpaceMouse);
+        ret = pthread_create(&mDDSpaceMouse->thread, 0, MDD_spaceMouseXEventsProcessing, mDDSpaceMouse);
         if (ret) {
-            ModelicaFormatError("MDDSpaceMouse.c: pthread(..) failed (%s)\n", strerror(errno));
+            ModelicaFormatError("MDDSpaceMouse.c: pthread(..) failed (%s)\n", strerror(ret));
         }
+    }
+
+    if (mDDSpaceMouse->failed) {
+        ModelicaFormatError("%s", mDDSpaceMouse->error);
     }
 
     for (i=0; i < MDD_N_AXES; i++) {
@@ -391,7 +408,7 @@ MDD_spaceMouseGetData(double * pdAxes, int * piButtons) {
  *
  * @param p_mDDSpaceMouse pointer address to MDDSpaceMouse object
  */
-int MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse) {
+static void* MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse) {
     MDDSpaceMouse* mDDSpaceMouse = (MDDSpaceMouse*) p_mDDSpaceMouse;
 
     Display *display;
@@ -413,12 +430,12 @@ int MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse) {
     wmhints = XAllocWMHints();
     classhints = XAllocClassHint();
     if ( (wmhints==NULL) || (classhints==NULL) ) {
-        ModelicaFormatError("MDDSpaceMouse.c: XAllocWMHints or XAllocClassHint failed\n" );
+        return MDD_spaceMouseFail(mDDSpaceMouse, "MDDSpaceMouse.c: XAllocWMHints or XAllocClassHint failed\n" );
     }
 
     display = XOpenDisplay( NULL );
     if ( display == NULL ) {
-        ModelicaFormatError("MDDSpaceMouse.c: XOpenDisplay failed \n");
+        return MDD_spaceMouseFail(mDDSpaceMouse, "MDDSpaceMouse.c: XOpenDisplay failed \n");
     }
 
     window = XCreateSimpleWindow( display, DefaultRootWindow(display),
@@ -441,7 +458,7 @@ int MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse) {
 
     /* Magellan Event Types */
     if ( !MagellanInit( display, window ) ) {
-        ModelicaFormatError("Space Mouse (Magellan) driver not running. Exit ... \n" );
+        return MDD_spaceMouseFail(mDDSpaceMouse, "Space Mouse (Magellan) driver not running. Exit ... \n" );
     }
 
 #if MDD_DEBUG
@@ -499,7 +516,7 @@ int MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse) {
                             mDDSpaceMouse->buttons[i] = 1;
                         }
                         else {
-                            ModelicaFormatError("MDDSpaceMouse.c: Button %i is out of range (max=%d)\n", i, MDD_N_BUTTONS - 1);
+                            return MDD_spaceMouseFail(mDDSpaceMouse, "MDDSpaceMouse.c: Button %i is out of range (max=%d)\n", i, MDD_N_BUTTONS - 1);
                         }
 
                         break;
@@ -518,7 +535,7 @@ int MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse) {
                             mDDSpaceMouse->buttons[i] = 0;
                         }
                         else {
-                            ModelicaFormatError("MDDSpaceMouse.c: Button %i is out of range (max=%d)\n", i, MDD_N_BUTTONS - 1);
+                            return MDD_spaceMouseFail(mDDSpaceMouse, "MDDSpaceMouse.c: Button %i is out of range (max=%d)\n", i, MDD_N_BUTTONS - 1);
                         }
                         break;
 
@@ -537,7 +554,7 @@ int MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse) {
     XDestroyWindow( display, window );
     XCloseDisplay( display );
 
-    return 0;
+    return NULL;
 }
 
 #else

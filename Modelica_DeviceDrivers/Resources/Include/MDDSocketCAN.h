@@ -63,6 +63,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -90,9 +91,30 @@ typedef struct {
     pthread_mutex_t mapMutex; /**< Exclusive access to p_mDDMapIntpVoid */
     pthread_t thread;
     int runReceive; /**< Run receiving thread as long as runReceive != 0  */
+    int failed; /**< The receiving thread stopped on the error below */
+    char error[256];
 } MDDSocketCAN;
 
 void* MDD_socketCANRxThread(void* p_mDDSocketCAN);
+
+/* ModelicaError and ModelicaFormatError must not return to their caller, and
+ * how a tool arranges that is up to the tool -- none of it need work from a
+ * thread the library started itself. Record the message here and stop;
+ * MDD_socketCANCheck raises it from a function the simulation called. */
+static void MDD_socketCANFail(MDDSocketCAN* mDDSocketCAN, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(mDDSocketCAN->error, sizeof(mDDSocketCAN->error), format, args);
+    va_end(args);
+    mDDSocketCAN->failed = 1;
+    mDDSocketCAN->runReceive = 0;
+}
+
+static void MDD_socketCANCheck(MDDSocketCAN* mDDSocketCAN) {
+    if (mDDSocketCAN->failed) {
+        ModelicaFormatError("%s", mDDSocketCAN->error);
+    }
+}
 
 /** Create RAW can socket and bind it to the CAN network interface ifname
  *
@@ -149,6 +171,7 @@ void* MDD_socketCANConstructor(const char* ifname) {
     }
 
     /* Start dedicated receiver thread */
+    mDDSocketCAN->failed = 0;
     mDDSocketCAN->runReceive = 1;
     ret = pthread_create(&mDDSocketCAN->thread, 0, MDD_socketCANRxThread, mDDSocketCAN);
     if (ret) {
@@ -203,6 +226,7 @@ void MDD_socketCANDestructor(void* p_mDDSocketCAN) {
 void MDD_socketCANDefineObject(void* p_mDDSocketCAN, int can_id, int can_dlc) {
     MDDSocketCAN * mDDSocketCAN = (MDDSocketCAN *) p_mDDSocketCAN;
     char * data;
+    MDD_socketCANCheck(mDDSocketCAN);
 
     data = calloc(sizeof(char), can_dlc);
 
@@ -226,6 +250,7 @@ void MDD_socketCANWrite(void* p_mDDSocketCAN, int can_id, int can_dlc,
     MDDSocketCAN * mDDSocketCAN = (MDDSocketCAN *) p_mDDSocketCAN;
     ssize_t bytes_sent;
     struct can_frame txframe;
+    MDD_socketCANCheck(mDDSocketCAN);
     txframe.can_id = can_id;
     memcpy(txframe.data, data, can_dlc);
     txframe.can_dlc = can_dlc;
@@ -268,6 +293,7 @@ const char * MDD_socketCANRead(void* p_mDDSocketCAN, int can_id, int can_dlc) {
     MDDSocketCAN * mDDSocketCAN = (MDDSocketCAN *) p_mDDSocketCAN;
     void * value;
     char* data = ModelicaAllocateString(can_dlc);
+    MDD_socketCANCheck(mDDSocketCAN);
     if (data) {
         /* Ensure exclusive access to map */
         pthread_mutex_lock(&(mDDSocketCAN->mapMutex));
@@ -294,6 +320,7 @@ void MDD_socketCANReadP(void* p_mDDSocketCAN, int can_id, int can_dlc,
     MDDSocketCAN * mDDSocketCAN = (MDDSocketCAN *) p_mDDSocketCAN;
     void * value;
     int rc;
+    MDD_socketCANCheck(mDDSocketCAN);
     /* Ensure exclusive access to map */
     pthread_mutex_lock(&(mDDSocketCAN->mapMutex));
     value = MDD_mapIntpVoidLookup(mDDSocketCAN->p_mDDMapIntpVoid, can_id);
@@ -326,26 +353,27 @@ void* MDD_socketCANRxThread(void* p_mDDSocketCAN) {
         ret = poll(&sock_poll, 1, 100);
         switch (ret) {
             case -1:
-                ModelicaFormatError("MDDSocketCAN.h: poll(..) failed (%s) \n",
-                                    strerror(errno));
+                MDD_socketCANFail(mDDSocketCAN, "MDDSocketCAN.h: poll(..) failed (%s) \n",
+                                  strerror(errno));
                 break;
             case 0: /* no new data available. Just check if mDDSocketCAN->runReceive still true and go on */
                 break;
             case 1: /* new data available */
                 if(sock_poll.revents & POLLHUP) {
-                    ModelicaFormatError("MDDSocketCAN.h: (%s): The CAN socket was disconnected.\n",
-                                        mDDSocketCAN->ifr.ifr_name);
+                    MDD_socketCANFail(mDDSocketCAN, "MDDSocketCAN.h: (%s): The CAN socket was disconnected.\n",
+                                      mDDSocketCAN->ifr.ifr_name);
+                    break;
                 }
                 else {
                     /* Receive the next CAN frame  */
                     bytes_read = read( mDDSocketCAN->skt, &rxframe, sizeof(rxframe) );
                     if (bytes_read < 0) {
-                        ModelicaFormatError("MDDSocketCAN.h: read(..) failed (%s)\n",
-                                            strerror(errno));
+                        MDD_socketCANFail(mDDSocketCAN, "MDDSocketCAN.h: read(..) failed (%s)\n",
+                                          strerror(errno));
                     }
                     else if (bytes_read == 0) {
-                        ModelicaFormatError("MDDSocketCAN.h: Error (zero bytes read): %s\n",
-                                            strerror(errno));
+                        MDD_socketCANFail(mDDSocketCAN, "MDDSocketCAN.h: Error (zero bytes read): %s\n",
+                                          strerror(errno));
                     }
                     else {
                         /* Lock access to map  */
@@ -361,7 +389,7 @@ void* MDD_socketCANRxThread(void* p_mDDSocketCAN) {
                     break;
                 }
             default:
-                ModelicaFormatError("MDDSocketCAN.h: Poll returned %d. That should not happen.\n", ret);
+                MDD_socketCANFail(mDDSocketCAN, "MDDSocketCAN.h: Poll returned %d. That should not happen.\n", ret);
         }
     }
     return NULL;
@@ -387,12 +415,12 @@ int MDD_socketCANRxThread_DEPRECATED(void* p_mDDSocketCAN) {
         /* Receive the next CAN frame  */
         bytes_read = read( mDDSocketCAN->skt, &rxframe, sizeof(struct can_frame) );
         if (bytes_read < 0) {
-            ModelicaFormatError("MDDSocketCAN.h: read(..) failed (%s)\n",
-                                strerror(errno));
+            MDD_socketCANFail(mDDSocketCAN, "MDDSocketCAN.h: read(..) failed (%s)\n",
+                              strerror(errno));
         }
         else if (bytes_read == 0) {
-            ModelicaFormatError("MDDSocketCAN.h: Error (zero bytes read): %s\n",
-                                strerror(errno));
+            MDD_socketCANFail(mDDSocketCAN, "MDDSocketCAN.h: Error (zero bytes read): %s\n",
+                              strerror(errno));
         }
         else {
             /* Lock access to map  */
