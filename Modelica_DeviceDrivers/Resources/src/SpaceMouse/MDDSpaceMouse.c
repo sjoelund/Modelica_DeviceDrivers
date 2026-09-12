@@ -334,6 +334,7 @@ DllExport void MDD_spaceMouseGetData(double * pdAxes, int * piButtons) {
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 #include <errno.h>
 #include <pthread.h>
 
@@ -362,15 +363,21 @@ typedef struct {
 
 static void* MDD_spaceMouseXEventsProcessing(void *p_mDDSpaceMouse);
 
+/* `failed` and `error` are written by the xevent thread and read by the thread
+ * Modelica calls on. One object only, so the lock can be a static one. */
+static pthread_mutex_t MDD_spaceMouseErrorMutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ModelicaFormatError must not return to its caller, and how a tool arranges
  * that is up to the tool -- none of it need work from a thread the library
  * started itself. Record it instead; MDD_spaceMouseGetData reports it. */
 static void* MDD_spaceMouseFail(MDDSpaceMouse* mDDSpaceMouse, const char* format, ...) {
     va_list args;
+    pthread_mutex_lock(&MDD_spaceMouseErrorMutex);
     va_start(args, format);
     vsnprintf(mDDSpaceMouse->error, sizeof(mDDSpaceMouse->error), format, args);
     va_end(args);
     mDDSpaceMouse->failed = 1;
+    pthread_mutex_unlock(&MDD_spaceMouseErrorMutex);
     return NULL;
 }
 
@@ -392,8 +399,19 @@ void MDD_spaceMouseGetData(double * pdAxes, int * piButtons) {
         }
     }
 
-    if (mDDSpaceMouse->failed) {
-        ModelicaFormatError("%s", mDDSpaceMouse->error);
+    {
+        char message[sizeof(mDDSpaceMouse->error)];
+        int failed;
+        pthread_mutex_lock(&MDD_spaceMouseErrorMutex);
+        failed = mDDSpaceMouse->failed;
+        if (failed) {
+            memcpy(message, mDDSpaceMouse->error, sizeof(message));
+        }
+        pthread_mutex_unlock(&MDD_spaceMouseErrorMutex);
+        /* Not while holding the lock: the call does not come back. */
+        if (failed) {
+            ModelicaFormatError("%s", message);
+        }
     }
 
     for (i=0; i < MDD_N_AXES; i++) {

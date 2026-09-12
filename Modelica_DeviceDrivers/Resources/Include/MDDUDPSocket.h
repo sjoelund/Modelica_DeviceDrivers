@@ -351,7 +351,8 @@ struct MDDUDPSocket_s {
     int useReceiveThread; /**< true, create dedicated receive thread and do not block main thread for incoming data (latest available data is used) */
     int runReceive; /**< Run receiving thread as long as runReceive != 0  */
     pthread_t thread;
-    pthread_mutex_t messageMutex; /**< Exclusive access to message buffer */
+    int threadCreated; /**< pthread_create succeeded, so the thread must be joined */
+    pthread_mutex_t messageMutex; /**< Exclusive access to message buffer, and to the two below */
     int failed; /**< The receiving thread stopped on the error below */
     char error[256];
 };
@@ -362,16 +363,27 @@ struct MDDUDPSocket_s {
  * MDD_udpCheck raises it from a function the simulation called. */
 static void MDD_udpFail(MDDUDPSocket* udp, const char* format, ...) {
     va_list args;
+    pthread_mutex_lock(&(udp->messageMutex));
     va_start(args, format);
     vsnprintf(udp->error, sizeof(udp->error), format, args);
     va_end(args);
     udp->failed = 1;
+    pthread_mutex_unlock(&(udp->messageMutex));
     udp->runReceive = 0;
 }
 
 static void MDD_udpCheck(MDDUDPSocket* udp) {
-    if (udp->failed) {
-        ModelicaFormatError("%s", udp->error);
+    char message[sizeof(udp->error)];
+    int failed;
+    pthread_mutex_lock(&(udp->messageMutex));
+    failed = udp->failed;
+    if (failed) {
+        memcpy(message, udp->error, sizeof(message));
+    }
+    pthread_mutex_unlock(&(udp->messageMutex));
+    /* Not while holding the lock: the call does not come back. */
+    if (failed) {
+        ModelicaFormatError("%s", message);
     }
 }
 
@@ -803,6 +815,9 @@ void * MDD_udpConstructor(int port, int bufferSize, int useReceiveThread) {
             if (ret) {
                 ModelicaFormatError("MDDUDPSocket: pthread_create(..) failed\n");
             }
+            else {
+                udp->threadCreated = 1;
+            }
         }
     }
 
@@ -815,12 +830,14 @@ void * MDD_udpConstructor(int port, int bufferSize, int useReceiveThread) {
 void MDD_udpDestructor(void * p_udp) {
     MDDUDPSocket * udp = (MDDUDPSocket *) p_udp;
 
-    /* stop receiving thread if any */
-    if (udp->runReceive) {
+    /* stop receiving thread if any. Not conditional on runReceive: a thread that
+       stopped on an error of its own has already cleared it, and still has to be
+       joined before the mutex and the object go away. */
+    if (udp->threadCreated) {
         void * pRet;
         udp->runReceive = 0;
         pthread_join(udp->thread, &pRet);
-        pthread_detach(udp->thread);
+        udp->threadCreated = 0;
     }
 
     if (pthread_mutex_destroy(&(udp->messageMutex)) != 0) {

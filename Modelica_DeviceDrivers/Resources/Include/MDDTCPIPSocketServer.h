@@ -538,7 +538,7 @@ struct MDDTCPIPServer_s {
   int runAcceptingThread;
   pthread_t hThread;
   pthread_mutex_t tcpipLock;
-  int failed; /**< The accepting thread stopped on the error below */
+  int failed; /**< The accepting thread stopped on the error below; both under tcpipLock */
   char error[256];
 };
 
@@ -550,16 +550,27 @@ DllExport void MDD_TCPIPServer_Destructor(void * p_tcpip);
  * MDD_TCPIPServer_Check raises it from a function the simulation called. */
 static void MDD_TCPIPServer_Fail(MDDTCPIPServer* tcpip, const char* format, ...) {
     va_list args;
+    pthread_mutex_lock(&(tcpip->tcpipLock));
     va_start(args, format);
     vsnprintf(tcpip->error, sizeof(tcpip->error), format, args);
     va_end(args);
     tcpip->failed = 1;
+    pthread_mutex_unlock(&(tcpip->tcpipLock));
     tcpip->runAcceptingThread = 0;
 }
 
 static void MDD_TCPIPServer_Check(MDDTCPIPServer* tcpip) {
-    if (tcpip->failed) {
-        ModelicaFormatError("%s", tcpip->error);
+    char message[sizeof(tcpip->error)];
+    int failed;
+    pthread_mutex_lock(&(tcpip->tcpipLock));
+    failed = tcpip->failed;
+    if (failed) {
+        memcpy(message, tcpip->error, sizeof(message));
+    }
+    pthread_mutex_unlock(&(tcpip->tcpipLock));
+    /* Not while holding the lock: the call does not come back. */
+    if (failed) {
+        ModelicaFormatError("%s", message);
     }
 }
 

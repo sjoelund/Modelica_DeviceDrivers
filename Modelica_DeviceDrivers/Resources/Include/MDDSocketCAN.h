@@ -90,8 +90,9 @@ typedef struct {
                               identifier (key) to corresponding frame payload data (value) */
     pthread_mutex_t mapMutex; /**< Exclusive access to p_mDDMapIntpVoid */
     pthread_t thread;
+    int threadCreated; /**< pthread_create succeeded, so the thread must be joined */
     int runReceive; /**< Run receiving thread as long as runReceive != 0  */
-    int failed; /**< The receiving thread stopped on the error below */
+    int failed; /**< The receiving thread stopped on the error below; both under mapMutex */
     char error[256];
 } MDDSocketCAN;
 
@@ -103,16 +104,27 @@ void* MDD_socketCANRxThread(void* p_mDDSocketCAN);
  * MDD_socketCANCheck raises it from a function the simulation called. */
 static void MDD_socketCANFail(MDDSocketCAN* mDDSocketCAN, const char* format, ...) {
     va_list args;
+    pthread_mutex_lock(&(mDDSocketCAN->mapMutex));
     va_start(args, format);
     vsnprintf(mDDSocketCAN->error, sizeof(mDDSocketCAN->error), format, args);
     va_end(args);
     mDDSocketCAN->failed = 1;
+    pthread_mutex_unlock(&(mDDSocketCAN->mapMutex));
     mDDSocketCAN->runReceive = 0;
 }
 
 static void MDD_socketCANCheck(MDDSocketCAN* mDDSocketCAN) {
-    if (mDDSocketCAN->failed) {
-        ModelicaFormatError("%s", mDDSocketCAN->error);
+    char message[sizeof(mDDSocketCAN->error)];
+    int failed;
+    pthread_mutex_lock(&(mDDSocketCAN->mapMutex));
+    failed = mDDSocketCAN->failed;
+    if (failed) {
+        memcpy(message, mDDSocketCAN->error, sizeof(message));
+    }
+    pthread_mutex_unlock(&(mDDSocketCAN->mapMutex));
+    /* Not while holding the lock: the call does not come back. */
+    if (failed) {
+        ModelicaFormatError("%s", message);
     }
 }
 
@@ -126,7 +138,7 @@ static void MDD_socketCANCheck(MDDSocketCAN* mDDSocketCAN) {
  * @return Modelica external object (MDDSocketCAN)
  */
 void* MDD_socketCANConstructor(const char* ifname) {
-    MDDSocketCAN* mDDSocketCAN = (MDDSocketCAN*) malloc(sizeof(MDDSocketCAN));
+    MDDSocketCAN* mDDSocketCAN = (MDDSocketCAN*) calloc(1, sizeof(MDDSocketCAN));
     int ret;
 
     ModelicaFormatMessage("SocketCAN (%s): Creating CAN_RAW socket ...", ifname);
@@ -171,11 +183,13 @@ void* MDD_socketCANConstructor(const char* ifname) {
     }
 
     /* Start dedicated receiver thread */
-    mDDSocketCAN->failed = 0;
     mDDSocketCAN->runReceive = 1;
     ret = pthread_create(&mDDSocketCAN->thread, 0, MDD_socketCANRxThread, mDDSocketCAN);
     if (ret) {
         ModelicaFormatError("MDDSocketCAN.h: pthread_create(..) failed\n");
+    }
+    else {
+        mDDSocketCAN->threadCreated = 1;
     }
 
     return mDDSocketCAN;
@@ -187,11 +201,13 @@ void MDD_socketCANDestructor(void* p_mDDSocketCAN) {
     void * pRet;
     char * data;
 
-    /* stop receiving thread if any */
-    if (mDDSocketCAN->runReceive) {
+    /* stop receiving thread if any. Not conditional on runReceive: a thread that
+       stopped on an error of its own has already cleared it, and still has to be
+       joined before the mutex and the object go away. */
+    if (mDDSocketCAN->threadCreated) {
         mDDSocketCAN->runReceive = 0;
         pthread_join(mDDSocketCAN->thread, &pRet);
-        pthread_detach(mDDSocketCAN->thread);
+        mDDSocketCAN->threadCreated = 0;
     }
 
     if (pthread_mutex_destroy(&(mDDSocketCAN->mapMutex)) != 0) {

@@ -369,7 +369,8 @@ typedef struct {
     ssize_t nReceivedBytes; /**< Number of received bytes (only kept for backwards compatiblity) */
     int runReceive; /**< Run receiving thread as long as runReceive != 0 */
     pthread_t thread;
-    pthread_mutex_t messageMutex; /**< Exclusive access to msgLastComplete and nReceivedBytes */
+    int threadCreated; /**< pthread_create succeeded, so the thread must be joined */
+    pthread_mutex_t messageMutex; /**< Exclusive access to msgLastComplete, nReceivedBytes and the two below */
     int failed; /**< The receiving thread stopped on the error below */
     char error[256];
 } MDDSerialPort;
@@ -382,16 +383,27 @@ void* MDD_serialPortReceivingThread(void * p_serial);
  * MDD_serialPortCheck raises it from a function the simulation called. */
 static void MDD_serialPortFail(MDDSerialPort* serial, const char* format, ...) {
     va_list args;
+    pthread_mutex_lock(&(serial->messageMutex));
     va_start(args, format);
     vsnprintf(serial->error, sizeof(serial->error), format, args);
     va_end(args);
     serial->failed = 1;
+    pthread_mutex_unlock(&(serial->messageMutex));
     serial->runReceive = 0;
 }
 
 static void MDD_serialPortCheck(MDDSerialPort* serial) {
-    if (serial->failed) {
-        ModelicaFormatError("%s", serial->error);
+    char message[sizeof(serial->error)];
+    int failed;
+    pthread_mutex_lock(&(serial->messageMutex));
+    failed = serial->failed;
+    if (failed) {
+        memcpy(message, serial->error, sizeof(message));
+    }
+    pthread_mutex_unlock(&(serial->messageMutex));
+    /* Not while holding the lock: the call does not come back. */
+    if (failed) {
+        ModelicaFormatError("%s", message);
     }
 }
 
@@ -594,6 +606,9 @@ void * MDD_serialPortConstructor(const char * deviceName, int bufferSize, int pa
         if (ret) {
             ModelicaFormatError("MDDSerialPort.h: pthread_create(..) failed\n");
         }
+        else {
+            serial->threadCreated = 1;
+        }
     }
 
     return (void *) serial;
@@ -749,10 +764,13 @@ void MDD_serialPortDestructor(void * p_serial) {
     void * pRet;
 
     /* stop receiving thread if any */
-    if (serial->runReceive) {
+    /* Not conditional on runReceive: a thread that stopped on an error of its own
+       has already cleared it, and still has to be joined before the mutex and the
+       object go away. */
+    if (serial->threadCreated) {
         serial->runReceive = 0;
         pthread_join(serial->thread, &pRet);
-        pthread_detach(serial->thread);
+        serial->threadCreated = 0;
     }
 
     if (pthread_mutex_destroy(&(serial->messageMutex)) != 0) {
